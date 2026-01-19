@@ -2,6 +2,8 @@ use std::fs;
 use std::net::UdpSocket;
 use std::time::Duration;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 const TRACKERS: &[&str] = &[
     "tracker.opentrackr.org:1337",
@@ -17,6 +19,7 @@ const TRACKERS: &[&str] = &[
 
 const BATCH_SIZE: usize = 50;
 const TIMEOUT_SECS: u64 = 5;
+const PARALLEL_BATCHES: usize = 10; // Procesar 10 batches simultáneamente
 
 #[derive(Debug, Clone)]
 struct TorrentStats {
@@ -70,11 +73,10 @@ impl CsvRecord {
     }
 }
 
-// Protocolo UDP Tracker simplificado
+// Protocolo UDP Tracker
 fn scrape_udp_tracker(tracker: &str, infohashes: &[Vec<u8>]) -> HashMap<String, TorrentStats> {
     let mut results = HashMap::new();
     
-    // Conectar al tracker
     let socket = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
         Err(_) => return results,
@@ -91,8 +93,8 @@ fn scrape_udp_tracker(tracker: &str, infohashes: &[Vec<u8>]) -> HashMap<String, 
     // 1. Connect request
     let transaction_id: u32 = rand::random();
     let mut connect_req = Vec::new();
-    connect_req.extend_from_slice(&0x41727101980u64.to_be_bytes()); // protocol_id
-    connect_req.extend_from_slice(&0u32.to_be_bytes()); // action = connect
+    connect_req.extend_from_slice(&0x41727101980u64.to_be_bytes());
+    connect_req.extend_from_slice(&0u32.to_be_bytes());
     connect_req.extend_from_slice(&transaction_id.to_be_bytes());
     
     if socket.send(&connect_req).is_err() {
@@ -118,10 +120,9 @@ fn scrape_udp_tracker(tracker: &str, infohashes: &[Vec<u8>]) -> HashMap<String, 
     let scrape_trans_id: u32 = rand::random();
     let mut scrape_req = Vec::new();
     scrape_req.extend_from_slice(&connection_id.to_be_bytes());
-    scrape_req.extend_from_slice(&2u32.to_be_bytes()); // action = scrape
+    scrape_req.extend_from_slice(&2u32.to_be_bytes());
     scrape_req.extend_from_slice(&scrape_trans_id.to_be_bytes());
     
-    // Agregar hasta 74 infohashes (límite UDP)
     let chunk_size = 74.min(infohashes.len());
     for hash in &infohashes[..chunk_size] {
         scrape_req.extend_from_slice(hash);
@@ -139,21 +140,14 @@ fn scrape_udp_tracker(tracker: &str, infohashes: &[Vec<u8>]) -> HashMap<String, 
             let recv_trans = u32::from_be_bytes([response[4], response[5], response[6], response[7]]);
             
             if recv_action == 2 && recv_trans == scrape_trans_id {
-                // Parsear resultados (12 bytes por torrent)
                 let mut offset = 8;
-                for (_i, hash) in infohashes[..chunk_size].iter().enumerate() {
+                for hash in &infohashes[..chunk_size] {
                     if offset + 12 <= n {
                         let seeders = u32::from_be_bytes([
                             response[offset],
                             response[offset + 1],
                             response[offset + 2],
                             response[offset + 3],
-                        ]);
-                        let _completed = u32::from_be_bytes([
-                            response[offset + 4],
-                            response[offset + 5],
-                            response[offset + 6],
-                            response[offset + 7],
                         ]);
                         let leechers = u32::from_be_bytes([
                             response[offset + 8],
@@ -175,12 +169,42 @@ fn scrape_udp_tracker(tracker: &str, infohashes: &[Vec<u8>]) -> HashMap<String, 
     results
 }
 
+fn scrape_all_trackers_parallel(infohashes: &[Vec<u8>]) -> Vec<HashMap<String, TorrentStats>> {
+    let results = Arc::new(Mutex::new(Vec::new()));
+    let mut handles = vec![];
+    
+    for tracker in TRACKERS {
+        let tracker = tracker.to_string();
+        let infohashes = infohashes.to_vec();
+        let results = Arc::clone(&results);
+        
+        let handle = thread::spawn(move || {
+            if let Ok(tracker_results) = std::panic::catch_unwind(|| {
+                scrape_udp_tracker(&tracker, &infohashes)
+            }) {
+                if !tracker_results.is_empty() {
+                    results.lock().unwrap().push(tracker_results);
+                }
+            }
+        });
+        
+        handles.push(handle);
+    }
+    
+    // Esperar a que todos los threads terminen
+    for handle in handles {
+        let _ = handle.join();
+    }
+    
+    let final_results = results.lock().unwrap().clone();
+    final_results
+}
+
 fn process_batch(
     batch_indices: Vec<usize>,
     batch_hashes: Vec<String>,
     data_lines: &[String],
 ) -> Vec<(usize, Option<CsvRecord>)> {
-    // Convertir hashes a bytes
     let hash_bytes: Vec<Vec<u8>> = batch_hashes
         .iter()
         .filter_map(|h| hex::decode(h).ok())
@@ -197,18 +221,8 @@ fn process_batch(
             .collect();
     }
     
-    // Consultar todos los trackers
-    let mut all_results: Vec<HashMap<String, TorrentStats>> = Vec::new();
-    
-    for tracker in TRACKERS {
-        if let Ok(results) = std::panic::catch_unwind(|| {
-            scrape_udp_tracker(tracker, &hash_bytes)
-        }) {
-            if !results.is_empty() {
-                all_results.push(results);
-            }
-        }
-    }
+    // Consultar todos los trackers EN PARALELO
+    let all_results = scrape_all_trackers_parallel(&hash_bytes);
     
     // Consolidar resultados
     let mut final_results = Vec::new();
@@ -234,12 +248,10 @@ fn process_batch(
         let original_line = &data_lines[line_idx];
         
         if !any_success {
-            // Failed - mantener original
             if let Some(record) = CsvRecord::from_line(original_line) {
                 final_results.push((line_idx, Some(record)));
             }
         } else if max_seeders > 0 || max_leechers > 0 {
-            // Alive - actualizar
             if let Some(mut record) = CsvRecord::from_line(original_line) {
                 record.seeders = max_seeders;
                 record.leechers = max_leechers;
@@ -247,7 +259,6 @@ fn process_batch(
                 final_results.push((line_idx, Some(record)));
             }
         } else {
-            // Dead - marcar para borrar
             final_results.push((line_idx, None));
         }
     }
@@ -258,7 +269,6 @@ fn process_batch(
 fn main() -> std::io::Result<()> {
     let current_dir = std::env::current_dir()?;
     
-    // Buscar archivos CSV
     let mut files: Vec<_> = fs::read_dir(&current_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| {
@@ -268,7 +278,6 @@ fn main() -> std::io::Result<()> {
         })
         .collect();
     
-    // Ordenar por número
     files.sort_by(|a, b| {
         let extract_num = |path: &std::fs::DirEntry| -> u32 {
             let name = path.file_name();
@@ -305,44 +314,73 @@ fn main() -> std::io::Result<()> {
         let data_lines = &lines[1..];
         let total = data_lines.len();
         
-        println!("Checking {} torrents in batches of {}...", total, BATCH_SIZE);
+        println!(
+            "Checking {} torrents (Batch: {}, Parallel batches: {}, Trackers in parallel: {})...",
+            total, BATCH_SIZE, PARALLEL_BATCHES, TRACKERS.len()
+        );
         
-        let mut updated_records: HashMap<usize, Option<CsvRecord>> = HashMap::new();
-        let mut processed = 0;
-        let mut alive = 0;
-        let mut dead = 0;
-        let mut failed = 0;
+        let updated_records = Arc::new(Mutex::new(HashMap::new()));
+        let stats = Arc::new(Mutex::new((0, 0, 0, 0))); // processed, alive, dead, failed
         
-        // Procesar en batches
-        for i in (0..total).step_by(BATCH_SIZE) {
-            let mut batch_indices = Vec::new();
-            let mut batch_hashes = Vec::new();
+        // Procesar múltiples batches en paralelo
+        for chunk_start in (0..total).step_by(BATCH_SIZE * PARALLEL_BATCHES) {
+            let mut batch_handles = vec![];
             
-            for idx in i..(i + BATCH_SIZE).min(total) {
-                let line = &data_lines[idx];
-                if let Some(infohash) = line.split(';').next() {
-                    if !infohash.is_empty() && infohash.len() == 40 {
-                        batch_indices.push(idx);
-                        batch_hashes.push(infohash.to_string());
-                    }
+            for batch_offset in 0..PARALLEL_BATCHES {
+                let i = chunk_start + (batch_offset * BATCH_SIZE);
+                if i >= total {
+                    break;
                 }
-            }
-            
-            if !batch_hashes.is_empty() {
-                let batch_results = process_batch(batch_indices, batch_hashes, data_lines);
                 
-                for (idx, record_opt) in batch_results {
-                    updated_records.insert(idx, record_opt.clone());
-                    processed += 1;
-                    
-                    match record_opt {
-                        Some(record) if record.seeders > 0 || record.leechers > 0 => alive += 1,
-                        Some(_) => failed += 1,
-                        None => dead += 1,
+                let mut batch_indices = Vec::new();
+                let mut batch_hashes = Vec::new();
+                
+                for idx in i..(i + BATCH_SIZE).min(total) {
+                    let line = &data_lines[idx];
+                    if let Some(infohash) = line.split(';').next() {
+                        if !infohash.is_empty() && infohash.len() == 40 {
+                            batch_indices.push(idx);
+                            batch_hashes.push(infohash.to_string());
+                        }
                     }
                 }
+                
+                if batch_hashes.is_empty() {
+                    continue;
+                }
+                
+                let data_lines_clone: Vec<String> = data_lines.to_vec();
+                let updated_records = Arc::clone(&updated_records);
+                let stats = Arc::clone(&stats);
+                
+                let handle = thread::spawn(move || {
+                    let batch_results = process_batch(batch_indices, batch_hashes, &data_lines_clone);
+                    
+                    let mut records = updated_records.lock().unwrap();
+                    let mut s = stats.lock().unwrap();
+                    
+                    for (idx, record_opt) in batch_results {
+                        records.insert(idx, record_opt.clone());
+                        s.0 += 1; // processed
+                        
+                        match record_opt {
+                            Some(record) if record.seeders > 0 || record.leechers > 0 => s.1 += 1, // alive
+                            Some(_) => s.3 += 1, // failed
+                            None => s.2 += 1, // dead
+                        }
+                    }
+                });
+                
+                batch_handles.push(handle);
             }
             
+            // Esperar a que terminen todos los batches de este chunk
+            for handle in batch_handles {
+                let _ = handle.join();
+            }
+            
+            let s = stats.lock().unwrap();
+            let (processed, alive, dead, failed) = *s;
             let percent = (processed as f64 / total as f64 * 100.0).round();
             print!(
                 "\r🚀 Progress: {:.2}% ({}/{}) | Alive: {} | Dead: {} | Failed: {}   ",
@@ -354,10 +392,10 @@ fn main() -> std::io::Result<()> {
         
         println!("\nWriting updated {}...", file_name);
         
-        // Reconstruir archivo
+        let final_records = updated_records.lock().unwrap();
         let mut final_lines = vec![header.clone()];
         for i in 0..total {
-            if let Some(Some(record)) = updated_records.get(&i) {
+            if let Some(Some(record)) = final_records.get(&i) {
                 final_lines.push(record.to_line());
             }
         }
