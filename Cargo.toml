@@ -16,8 +16,8 @@ rand = "0.8"
 
 [[bin]]
 name = "torrent-search"
-path = "src/main.rs"
+path = "main.rs"
 
 [[bin]]
 name = "tracker-scraper"
-path = "src/tracker_scraper.rs"
+path = "tracker_scraper.rs"
