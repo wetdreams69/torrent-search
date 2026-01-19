@@ -24,7 +24,7 @@ jobs:
       - name: Checkout torrent-search code
         uses: actions/checkout@v4
         with:
-          repository: TU-USUARIO/torrent-search  # ← Cambia esto por tu usuario
+          repository: wetdreams69/torrent-search  # ← Cambia esto por tu usuario
           path: torrent-search-code
       
       - name: Setup Rust
