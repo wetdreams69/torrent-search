@@ -1,0 +1,82 @@
+name: Update Tracker Stats
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'  # Cada 12 horas
+  workflow_dispatch:
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  update-stats:
+    name: Update Seeders and Leechers
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout calling repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Checkout torrent-search code
+        uses: actions/checkout@v4
+        with:
+          repository: wetdreams69/torrent-search
+          path: torrent-search-code
+      
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            torrent-search-code/target
+          key: ${{ runner.os }}-cargo-tracker-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Build tracker scraper
+        working-directory: torrent-search-code
+        run: cargo build --release --bin tracker-scraper
+      
+      - name: Copy binary to workspace
+        run: |
+          cp torrent-search-code/target/release/tracker-scraper ./
+          chmod +x tracker-scraper
+      
+      - name: Run tracker scraper
+        run: ./tracker-scraper
+      
+      - name: Check for changes
+        id: check-changes
+        run: |
+          if git diff --quiet; then
+            echo "changes=false" >> $GITHUB_OUTPUT
+            echo "No changes detected"
+          else
+            echo "changes=true" >> $GITHUB_OUTPUT
+            echo "Changes detected"
+            git diff --stat
+          fi
+      
+      - name: Commit and push changes
+        if: steps.check-changes.outputs.changes == 'true'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add *.csv
+          git commit -m "Update tracker stats - $(date +'%Y-%m-%d %H:%M:%S')"
+          git push
+      
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Tracker Stats Update Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository**: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Changes**: ${{ steps.check-changes.outputs.changes }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Date**: $(date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_STEP_SUMMARY
