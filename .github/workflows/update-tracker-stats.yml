@@ -1,8 +1,6 @@
 name: Update Tracker Stats
 
 on:
-  schedule:
-    - cron: '0 */12 * * *'  # Cada 12 horas
   workflow_dispatch:
   workflow_call:
 
