@@ -1,11 +1,8 @@
 name: Torrent Search and Update CSV
 
 on:
-  schedule:
-    - cron: '0 */6 * * *'
   workflow_dispatch:
-  workflow_call:  # Permite ser llamado desde otros repos
-
+  workflow_call:  
 env:
   CARGO_TERM_COLOR: always
 
@@ -24,7 +21,7 @@ jobs:
       - name: Checkout torrent-search code
         uses: actions/checkout@v4
         with:
-          repository: wetdreams69/torrent-search  # ← Cambia esto por tu usuario
+          repository: wetdreams69/torrent-search  
           path: torrent-search-code
       
       - name: Setup Rust
