@@ -11,18 +11,8 @@ serde_json = "1.0"
 chrono = "0.4"
 urlencoding = "2.1"
 tokio = { version = "1", features = ["full"] }
-futures = "0.3"
 hex = "0.4"
-url = "2.5"
-
-# Para el tracker scraper
-[dependencies.udp-tracker-client]
-version = "0.3"
-optional = true
-
-[features]
-default = ["scraper-mode"]
-scraper-mode = ["udp-tracker-client"]
+rand = "0.8"
 
 [[bin]]
 name = "torrent-search"
@@ -31,4 +21,3 @@ path = "src/main.rs"
 [[bin]]
 name = "tracker-scraper"
 path = "src/tracker_scraper.rs"
-required-features = ["scraper-mode"]

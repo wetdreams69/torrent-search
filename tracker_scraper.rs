@@ -1,31 +1,28 @@
 use std::fs;
-use std::path::Path;
+use std::net::UdpSocket;
 use std::time::Duration;
-use tokio::time::timeout;
-use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
+use std::io::Cursor;
 
 const TRACKERS: &[&str] = &[
-    "udp://tracker.opentrackr.org:1337/announce",
-    "udp://open.stealth.si:80/announce",
-    "udp://tracker.torrent.eu.org:451/announce",
-    "udp://exodus.desync.com:6969/announce",
-    "udp://tracker.moeking.me:6969/announce",
-    "udp://opentracker.i2p.rocks:6969/announce",
-    "udp://tracker.bitsearch.to:1337/announce",
-    "udp://tracker.tiny-vps.com:6969/announce",
-    "udp://tracker.openbittorrent.com:6969/announce",
+    "tracker.opentrackr.org:1337",
+    "open.stealth.si:80",
+    "tracker.torrent.eu.org:451",
+    "exodus.desync.com:6969",
+    "tracker.moeking.me:6969",
+    "opentracker.i2p.rocks:6969",
+    "tracker.bitsearch.to:1337",
+    "tracker.tiny-vps.com:6969",
+    "tracker.openbittorrent.com:6969",
 ];
 
 const BATCH_SIZE: usize = 50;
-const CONCURRENCY: usize = 10;
-const TIMEOUT_SECS: u64 = 8;
+const TIMEOUT_SECS: u64 = 5;
 
 #[derive(Debug, Clone)]
 struct TorrentStats {
     seeders: u32,
     leechers: u32,
-    found: bool,
 }
 
 #[derive(Debug)]
@@ -74,118 +71,164 @@ impl CsvRecord {
     }
 }
 
-async fn scrape_tracker(
-    infohashes: Vec<String>,
-    tracker_url: &str,
-) -> HashMap<String, TorrentStats> {
-    let result = timeout(
-        Duration::from_secs(TIMEOUT_SECS),
-        scrape_tracker_impl(infohashes, tracker_url),
-    )
-    .await;
-    
-    result.unwrap_or_else(|_| HashMap::new())
-}
-
-async fn scrape_tracker_impl(
-    infohashes: Vec<String>,
-    tracker_url: &str,
-) -> HashMap<String, TorrentStats> {
-    use udp_tracker_client::{Client, ScrapeRequest};
-    
+// Protocolo UDP Tracker simplificado
+fn scrape_udp_tracker(tracker: &str, infohashes: &[Vec<u8>]) -> HashMap<String, TorrentStats> {
     let mut results = HashMap::new();
     
-    // Parsear URL del tracker
-    let parsed = match tracker_url.parse::<url::Url>() {
-        Ok(u) => u,
+    // Conectar al tracker
+    let socket = match UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => s,
         Err(_) => return results,
     };
     
-    let host = match parsed.host_str() {
-        Some(h) => h,
-        None => return results,
-    };
-    
-    let port = parsed.port().unwrap_or(6969);
-    let addr = format!("{}:{}", host, port);
-    
-    // Convertir infohashes a bytes
-    let mut info_hashes = Vec::new();
-    for hash in &infohashes {
-        if let Ok(bytes) = hex::decode(hash) {
-            if bytes.len() == 20 {
-                let mut arr = [0u8; 20];
-                arr.copy_from_slice(&bytes);
-                info_hashes.push(arr);
-            }
-        }
-    }
-    
-    if info_hashes.is_empty() {
+    if socket.set_read_timeout(Some(Duration::from_secs(TIMEOUT_SECS))).is_err() {
         return results;
     }
     
-    // Conectar al tracker UDP
-    let client = match Client::connect(&addr).await {
-        Ok(c) => c,
-        Err(_) => return results,
+    if socket.connect(tracker).is_err() {
+        return results;
+    }
+    
+    // 1. Connect request
+    let transaction_id: u32 = rand::random();
+    let mut connect_req = Vec::new();
+    connect_req.extend_from_slice(&0x41727101980u64.to_be_bytes()); // protocol_id
+    connect_req.extend_from_slice(&0u32.to_be_bytes()); // action = connect
+    connect_req.extend_from_slice(&transaction_id.to_be_bytes());
+    
+    if socket.send(&connect_req).is_err() {
+        return results;
+    }
+    
+    let mut buf = [0u8; 16];
+    let connection_id = match socket.recv(&mut buf) {
+        Ok(16) => {
+            let recv_action = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            let recv_trans = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            
+            if recv_action != 0 || recv_trans != transaction_id {
+                return results;
+            }
+            
+            u64::from_be_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]])
+        }
+        _ => return results,
     };
     
-    // Hacer scrape
-    let request = ScrapeRequest {
-        info_hashes: &info_hashes,
-    };
+    // 2. Scrape request
+    let scrape_trans_id: u32 = rand::random();
+    let mut scrape_req = Vec::new();
+    scrape_req.extend_from_slice(&connection_id.to_be_bytes());
+    scrape_req.extend_from_slice(&2u32.to_be_bytes()); // action = scrape
+    scrape_req.extend_from_slice(&scrape_trans_id.to_be_bytes());
     
-    match client.scrape(&request).await {
-        Ok(response) => {
-            for (i, stats) in response.stats.iter().enumerate() {
-                if let Some(hash) = infohashes.get(i) {
-                    results.insert(
-                        hash.to_lowercase(),
-                        TorrentStats {
-                            seeders: stats.seeders,
-                            leechers: stats.leechers,
-                            found: true,
-                        },
-                    );
+    // Agregar hasta 74 infohashes (límite UDP)
+    let chunk_size = 74.min(infohashes.len());
+    for hash in &infohashes[..chunk_size] {
+        scrape_req.extend_from_slice(hash);
+    }
+    
+    if socket.send(&scrape_req).is_err() {
+        return results;
+    }
+    
+    // 3. Leer respuesta
+    let mut response = vec![0u8; 2048];
+    if let Ok(n) = socket.recv(&mut response) {
+        if n >= 8 {
+            let recv_action = u32::from_be_bytes([response[0], response[1], response[2], response[3]]);
+            let recv_trans = u32::from_be_bytes([response[4], response[5], response[6], response[7]]);
+            
+            if recv_action == 2 && recv_trans == scrape_trans_id {
+                // Parsear resultados (12 bytes por torrent)
+                let mut offset = 8;
+                for (i, hash) in infohashes[..chunk_size].iter().enumerate() {
+                    if offset + 12 <= n {
+                        let seeders = u32::from_be_bytes([
+                            response[offset],
+                            response[offset + 1],
+                            response[offset + 2],
+                            response[offset + 3],
+                        ]);
+                        let _completed = u32::from_be_bytes([
+                            response[offset + 4],
+                            response[offset + 5],
+                            response[offset + 6],
+                            response[offset + 7],
+                        ]);
+                        let leechers = u32::from_be_bytes([
+                            response[offset + 8],
+                            response[offset + 9],
+                            response[offset + 10],
+                            response[offset + 11],
+                        ]);
+                        
+                        let hash_str = hex::encode(hash).to_lowercase();
+                        results.insert(hash_str, TorrentStats { seeders, leechers });
+                        
+                        offset += 12;
+                    }
                 }
             }
         }
-        Err(_) => {}
     }
     
     results
 }
 
-async fn process_batch(
+fn process_batch(
     batch_indices: Vec<usize>,
     batch_hashes: Vec<String>,
     data_lines: &[String],
 ) -> Vec<(usize, Option<CsvRecord>)> {
-    // Consultar todos los trackers para este batch
-    let tracker_futures: Vec<_> = TRACKERS
+    // Convertir hashes a bytes
+    let hash_bytes: Vec<Vec<u8>> = batch_hashes
         .iter()
-        .map(|t| scrape_tracker(batch_hashes.clone(), t))
+        .filter_map(|h| hex::decode(h).ok())
+        .filter(|b| b.len() == 20)
         .collect();
     
-    let all_tracker_results = futures::future::join_all(tracker_futures).await;
+    if hash_bytes.is_empty() {
+        return batch_indices
+            .iter()
+            .map(|&idx| {
+                let record = CsvRecord::from_line(&data_lines[idx]);
+                (idx, record)
+            })
+            .collect();
+    }
     
-    // Consolidar resultados por infohash
-    let mut results = Vec::new();
+    // Consultar todos los trackers
+    let mut all_results: Vec<HashMap<String, TorrentStats>> = Vec::new();
+    
+    for tracker in TRACKERS {
+        if let Ok(results) = std::panic::catch_unwind(|| {
+            scrape_udp_tracker(tracker, &hash_bytes)
+        }) {
+            if !results.is_empty() {
+                all_results.push(results);
+            }
+        }
+    }
+    
+    // Consolidar resultados
+    let mut final_results = Vec::new();
     
     for (i, &line_idx) in batch_indices.iter().enumerate() {
+        if i >= batch_hashes.len() {
+            break;
+        }
+        
         let hash = batch_hashes[i].to_lowercase();
         let mut max_seeders = 0u32;
         let mut max_leechers = 0u32;
         let mut any_success = false;
         
-        for tracker_result in &all_tracker_results {
+        for tracker_result in &all_results {
             if let Some(stats) = tracker_result.get(&hash) {
-                if stats.found {
-                    max_seeders = max_seeders.max(stats.seeders);
-                    max_leechers = max_leechers.max(stats.leechers);
-                    any_success = true;
-                }
+                max_seeders = max_seeders.max(stats.seeders);
+                max_leechers = max_leechers.max(stats.leechers);
+                any_success = true;
             }
         }
         
@@ -194,7 +237,7 @@ async fn process_batch(
         if !any_success {
             // Failed - mantener original
             if let Some(record) = CsvRecord::from_line(original_line) {
-                results.push((line_idx, Some(record)));
+                final_results.push((line_idx, Some(record)));
             }
         } else if max_seeders > 0 || max_leechers > 0 {
             // Alive - actualizar
@@ -202,19 +245,18 @@ async fn process_batch(
                 record.seeders = max_seeders;
                 record.leechers = max_leechers;
                 record.scraped_date = chrono::Utc::now().timestamp();
-                results.push((line_idx, Some(record)));
+                final_results.push((line_idx, Some(record)));
             }
         } else {
             // Dead - marcar para borrar
-            results.push((line_idx, None));
+            final_results.push((line_idx, None));
         }
     }
     
-    results
+    final_results
 }
 
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
+fn main() -> std::io::Result<()> {
     let current_dir = std::env::current_dir()?;
     
     // Buscar archivos CSV
@@ -264,10 +306,7 @@ async fn main() -> std::io::Result<()> {
         let data_lines = &lines[1..];
         let total = data_lines.len();
         
-        println!(
-            "Checking {} torrents using Batch Scraping (Batch: {}, Parallel: {})...",
-            total, BATCH_SIZE, CONCURRENCY
-        );
+        println!("Checking {} torrents in batches of {}...", total, BATCH_SIZE);
         
         let mut updated_records: HashMap<usize, Option<CsvRecord>> = HashMap::new();
         let mut processed = 0;
@@ -275,47 +314,25 @@ async fn main() -> std::io::Result<()> {
         let mut dead = 0;
         let mut failed = 0;
         
-        // Procesar en batches con concurrencia
-        for i in (0..total).step_by(BATCH_SIZE * CONCURRENCY) {
-            let mut batch_futures = Vec::new();
+        // Procesar en batches
+        for i in (0..total).step_by(BATCH_SIZE) {
+            let mut batch_indices = Vec::new();
+            let mut batch_hashes = Vec::new();
             
-            for j in 0..CONCURRENCY {
-                let start = i + (j * BATCH_SIZE);
-                if start >= total {
-                    break;
-                }
-                
-                let mut batch_indices = Vec::new();
-                let mut batch_hashes = Vec::new();
-                
-                for k in 0..BATCH_SIZE {
-                    let idx = start + k;
-                    if idx >= total {
-                        break;
+            for idx in i..(i + BATCH_SIZE).min(total) {
+                let line = &data_lines[idx];
+                if let Some(infohash) = line.split(';').next() {
+                    if !infohash.is_empty() && infohash.len() == 40 {
+                        batch_indices.push(idx);
+                        batch_hashes.push(infohash.to_string());
                     }
-                    
-                    let line = &data_lines[idx];
-                    if let Some(infohash) = line.split(';').next() {
-                        if !infohash.is_empty() {
-                            batch_indices.push(idx);
-                            batch_hashes.push(infohash.to_string());
-                        }
-                    }
-                }
-                
-                if !batch_hashes.is_empty() {
-                    batch_futures.push(process_batch(
-                        batch_indices,
-                        batch_hashes,
-                        data_lines,
-                    ));
                 }
             }
             
-            let results = futures::future::join_all(batch_futures).await;
-            
-            for batch_result in results {
-                for (idx, record_opt) in batch_result {
+            if !batch_hashes.is_empty() {
+                let batch_results = process_batch(batch_indices, batch_hashes, data_lines);
+                
+                for (idx, record_opt) in batch_results {
                     updated_records.insert(idx, record_opt.clone());
                     processed += 1;
                     
@@ -325,17 +342,15 @@ async fn main() -> std::io::Result<()> {
                         None => dead += 1,
                     }
                 }
-                
-                if processed % 100 == 0 || processed >= total {
-                    let percent = (processed as f64 / total as f64 * 100.0).round();
-                    print!(
-                        "\r🚀 Progress: {:.2}% ({}/{}) | Alive: {} | Dead: {} | Failed: {}   ",
-                        percent, processed, total, alive, dead, failed
-                    );
-                    use std::io::Write;
-                    std::io::stdout().flush().unwrap();
-                }
             }
+            
+            let percent = (processed as f64 / total as f64 * 100.0).round();
+            print!(
+                "\r🚀 Progress: {:.2}% ({}/{}) | Alive: {} | Dead: {} | Failed: {}   ",
+                percent, processed, total, alive, dead, failed
+            );
+            use std::io::Write;
+            std::io::stdout().flush().unwrap();
         }
         
         println!("\nWriting updated {}...", file_name);
@@ -354,12 +369,3 @@ async fn main() -> std::io::Result<()> {
     println!("\n✅ All files updated.");
     Ok(())
 }
-
-// Cargo.toml dependencies adicionales:
-// [dependencies]
-// tokio = { version = "1", features = ["full"] }
-// futures = "0.3"
-// chrono = "0.4"
-// hex = "0.4"
-// url = "2.5"
-// udp-tracker-client = "0.3"  # Librería para UDP tracker protocol
