@@ -1,0 +1,85 @@
+name: Torrent Search and Update CSV
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+  workflow_call:  # Permite ser llamado desde otros repos
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  search-and-update:
+    name: Search Torrents and Update CSV
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout calling repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Checkout torrent-search code
+        uses: actions/checkout@v4
+        with:
+          repository: TU-USUARIO/torrent-search  # ← Cambia esto por tu usuario
+          path: torrent-search-code
+      
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            torrent-search-code/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Build project
+        working-directory: torrent-search-code
+        run: cargo build --release
+      
+      - name: Copy binary to workspace root
+        run: |
+          cp torrent-search-code/target/release/torrent-search ./
+          chmod +x torrent-search
+      
+      - name: Run torrent search
+        run: ./torrent-search
+      
+      - name: Check for changes
+        id: check-changes
+        run: |
+          if git diff --quiet; then
+            echo "changes=false" >> $GITHUB_OUTPUT
+            echo "No changes detected"
+          else
+            echo "changes=true" >> $GITHUB_OUTPUT
+            echo "Changes detected"
+            git diff --stat
+          fi
+      
+      - name: Commit and push changes
+        if: steps.check-changes.outputs.changes == 'true'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add *.csv
+          git commit -m "Update torrents CSV - $(date +'%Y-%m-%d %H:%M:%S')"
+          git push
+      
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Torrent Search Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository**: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Changes**: ${{ steps.check-changes.outputs.changes }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Date**: $(date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_STEP_SUMMARY
+          if [ -f torrents_part_*.csv ]; then
+            echo "- **CSV Files**: $(ls -1 torrents_part_*.csv | tr '\n' ', ')" >> $GITHUB_STEP_SUMMARY
+          fi
