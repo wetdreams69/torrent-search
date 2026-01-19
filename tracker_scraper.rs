@@ -2,7 +2,6 @@ use std::fs;
 use std::net::UdpSocket;
 use std::time::Duration;
 use std::collections::HashMap;
-use std::io::Cursor;
 
 const TRACKERS: &[&str] = &[
     "tracker.opentrackr.org:1337",
@@ -25,7 +24,7 @@ struct TorrentStats {
     leechers: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CsvRecord {
     infohash: String,
     name: String,
@@ -142,7 +141,7 @@ fn scrape_udp_tracker(tracker: &str, infohashes: &[Vec<u8>]) -> HashMap<String, 
             if recv_action == 2 && recv_trans == scrape_trans_id {
                 // Parsear resultados (12 bytes por torrent)
                 let mut offset = 8;
-                for (i, hash) in infohashes[..chunk_size].iter().enumerate() {
+                for (_i, hash) in infohashes[..chunk_size].iter().enumerate() {
                     if offset + 12 <= n {
                         let seeders = u32::from_be_bytes([
                             response[offset],
